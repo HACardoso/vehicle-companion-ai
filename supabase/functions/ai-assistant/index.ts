@@ -6,12 +6,13 @@ const corsHeaders = {
 };
 
 interface RequestBody {
-  type: 'obd' | 'diagnosis' | 'maintenance' | 'customer-message';
+  type: 'obd' | 'diagnosis' | 'maintenance' | 'maintenance-chat' | 'customer-message';
   vehicleId?: string;
   documentId?: string;
   input?: Record<string, unknown>;
   response?: unknown;
   vehicleName?: string;
+  chatHistory?: Array<{ role: 'user' | 'assistant'; content: string }>;
 }
 
 serve(async (req) => {
@@ -21,7 +22,7 @@ serve(async (req) => {
 
   try {
     const body: RequestBody = await req.json();
-    const { type, vehicleId, documentId, input, response: prevResponse, vehicleName } = body;
+    const { type, vehicleId, documentId, input, response: prevResponse, vehicleName, chatHistory } = body;
 
     const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY");
     if (!LOVABLE_API_KEY) {
@@ -116,8 +117,75 @@ Recomendações geradas: ${JSON.stringify(prevResponse)}
 Gere uma mensagem profissional para o cliente.`;
         break;
 
+      case "maintenance-chat":
+        // Handled separately below
+        break;
+
       default:
         throw new Error(`Tipo de consulta inválido: ${type}`);
+    }
+
+    // Handle maintenance-chat separately with chat history
+    if (type === 'maintenance-chat') {
+      const chatSystemPrompt = `Você é um assistente especializado em manutenção automotiva.
+REGRA FUNDAMENTAL: Você SOMENTE pode responder perguntas baseadas no conteúdo do manual/PDF do veículo.
+Se a pergunta não estiver relacionada ao manual ou manutenção do veículo, diga educadamente que só pode ajudar com informações do manual.
+
+Suas respostas devem:
+1. Ser claras e objetivas
+2. Incluir referências de página do manual quando possível (ex: "página 42")
+3. Listar procedimentos de forma numerada quando aplicável
+4. Alertar sobre questões de segurança quando relevante
+5. Usar linguagem acessível para leigos
+
+Se não encontrar a informação no PDF, diga: "Não encontrei essa informação específica no manual, mas posso dar uma orientação geral: [orientação]"
+
+Sempre termine respostas técnicas com: "Consulte um profissional para garantir a execução correta."`;
+
+      const messages = [
+        { role: "system", content: chatSystemPrompt },
+        ...(chatHistory || []).map(msg => ({ role: msg.role, content: msg.content })),
+        { role: "user", content: (input as { message: string })?.message || '' }
+      ];
+
+      const aiResponse = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${LOVABLE_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "google/gemini-3-flash-preview",
+          messages,
+        }),
+      });
+
+      if (!aiResponse.ok) {
+        const errorText = await aiResponse.text();
+        console.error("AI gateway error:", aiResponse.status, errorText);
+        throw new Error("Erro ao processar com IA");
+      }
+
+      const aiData = await aiResponse.json();
+      const content = aiData.choices?.[0]?.message?.content || "";
+
+      // Extract page references
+      const pageReferences: Array<{ page: number }> = [];
+      const pageMatches = content.matchAll(/página\s*(\d+)/gi);
+      for (const pm of pageMatches) {
+        const pageNum = parseInt(pm[1]);
+        if (!pageReferences.some(r => r.page === pageNum)) {
+          pageReferences.push({ page: pageNum });
+        }
+      }
+
+      return new Response(
+        JSON.stringify({
+          content,
+          references: pageReferences,
+        }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
     }
 
     console.log(`Processing ${type} request for vehicle ${vehicleId}`);
