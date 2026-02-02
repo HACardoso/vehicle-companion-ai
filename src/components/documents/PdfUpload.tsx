@@ -75,9 +75,9 @@ export function PdfUpload({ vehicleId, onSuccess }: PdfUploadProps) {
     setError(null);
 
     try {
-      // Simulate progress for UX
+      // Upload progress simulation
       const progressInterval = setInterval(() => {
-        setProgress((prev) => Math.min(prev + 10, 90));
+        setProgress((prev) => Math.min(prev + 5, 40));
       }, 200);
 
       const filePath = `${user.id}/${vehicleId}/${Date.now()}_${file.name}`;
@@ -91,10 +91,10 @@ export function PdfUpload({ vehicleId, onSuccess }: PdfUploadProps) {
 
       if (uploadError) throw uploadError;
 
-      setProgress(95);
+      setProgress(50);
 
-      // Create document record
-      const { error: dbError } = await supabase
+      // Create document record with 'processing' status
+      const { data: docData, error: dbError } = await supabase
         .from('vehicle_documents')
         .insert({
           vehicle_id: vehicleId,
@@ -102,18 +102,60 @@ export function PdfUpload({ vehicleId, onSuccess }: PdfUploadProps) {
           file_name: file.name,
           file_path: filePath,
           file_size: file.size,
-          status: 'ready', // In a real app, this would be 'processing' and updated by a backend job
-          extracted_text_length: 1000, // Placeholder - would be set by backend
-        });
+          status: 'processing',
+          extracted_text_length: 0,
+        })
+        .select()
+        .single();
 
       if (dbError) throw dbError;
 
+      setProgress(60);
+
+      // Call process-pdf edge function to extract text
+      toast({
+        title: 'Processando PDF...',
+        description: 'Extraindo texto do documento. Isso pode levar alguns segundos.',
+      });
+
+      const { data: processResult, error: processError } = await supabase.functions
+        .invoke('process-pdf', {
+          body: {
+            documentId: docData.id,
+            filePath: filePath,
+          },
+        });
+
+      setProgress(90);
+
+      if (processError) {
+        console.error('Process error:', processError);
+        // Update status to show processing failed
+        await supabase
+          .from('vehicle_documents')
+          .update({ 
+            status: 'insufficient_quality',
+            quality_notes: ['Erro ao processar o PDF. Tente novamente.']
+          })
+          .eq('id', docData.id);
+        
+        throw new Error('Erro ao processar o PDF');
+      }
+
       setProgress(100);
 
-      toast({
-        title: 'Documento pronto para usar',
-        description: `${file.name} foi enviado com sucesso.`,
-      });
+      if (processResult?.status === 'ready') {
+        toast({
+          title: 'Documento pronto para usar',
+          description: `${file.name} foi processado com sucesso. ${processResult.extractedTextLength?.toLocaleString('pt-BR')} caracteres extraídos.`,
+        });
+      } else if (processResult?.status === 'insufficient_quality') {
+        toast({
+          title: 'PDF com qualidade insuficiente',
+          description: 'O documento não pôde ser processado adequadamente. Veja as orientações abaixo.',
+          variant: 'destructive',
+        });
+      }
 
       queryClient.invalidateQueries({ queryKey: ['vehicle-document', vehicleId] });
       onSuccess?.();
