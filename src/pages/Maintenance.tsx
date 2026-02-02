@@ -1,297 +1,228 @@
-import { useState } from 'react';
+import { useState, useCallback } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { Wrench, Loader2, AlertCircle, Copy, Check } from 'lucide-react';
 import { MainLayout } from '@/components/layout/MainLayout';
-import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { VehicleSelector } from '@/components/ai/VehicleSelector';
-import { AIResponseDisplay } from '@/components/ai/AIResponseDisplay';
+import { ChatContainer } from '@/components/chat/ChatContainer';
 import { useVehicle, useVehicleDocument } from '@/hooks/useVehicles';
 import { supabase } from '@/integrations/supabase/client';
 import { useToast } from '@/hooks/use-toast';
-import { AIResponse } from '@/types/vehicle';
-import { format, isAfter, parseISO } from 'date-fns';
+import { ChatMessage } from '@/types/chat';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { FileText, MessageSquare } from 'lucide-react';
 
 export default function Maintenance() {
   const [searchParams] = useSearchParams();
   const [selectedVehicleId, setSelectedVehicleId] = useState<string>(
     searchParams.get('vehicle') || ''
   );
-  const [mileage, setMileage] = useState('');
-  const [lastServiceDate, setLastServiceDate] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [response, setResponse] = useState<AIResponse | null>(null);
-  const [customerMessage, setCustomerMessage] = useState<string | null>(null);
-  const [generatingMessage, setGeneratingMessage] = useState(false);
-  const [copied, setCopied] = useState(false);
-  const [errors, setErrors] = useState<{ mileage?: string; date?: string }>({});
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
 
   const { data: vehicle } = useVehicle(selectedVehicleId);
   const { data: document } = useVehicleDocument(selectedVehicleId);
   const { toast } = useToast();
 
-  const hasValidDocument = document?.status === 'ready';
+  const handleSendMessage = useCallback(async (content: string) => {
+    if (!selectedVehicleId || !document?.id) return;
 
-  const validate = (): boolean => {
-    const newErrors: { mileage?: string; date?: string } = {};
-    
-    const mileageNum = parseInt(mileage);
-    if (!mileage || isNaN(mileageNum) || mileageNum < 0) {
-      newErrors.mileage = 'Informe uma quilometragem válida (ex: 50000)';
-    }
+    const userMessage: ChatMessage = {
+      id: crypto.randomUUID(),
+      role: 'user',
+      content,
+      timestamp: new Date(),
+    };
 
-    if (!lastServiceDate) {
-      newErrors.date = 'Informe a data do último serviço';
-    } else {
-      const selectedDate = parseISO(lastServiceDate);
-      if (isAfter(selectedDate, new Date())) {
-        newErrors.date = 'A data não pode ser no futuro';
-      }
-    }
+    // Add user message and loading state
+    setMessages((prev) => [...prev, userMessage]);
+    setIsLoading(true);
 
-    setErrors(newErrors);
-    return Object.keys(newErrors).length === 0;
-  };
-
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    
-    if (!validate()) return;
-
-    if (!selectedVehicleId) {
-      toast({
-        title: 'Selecione um veículo',
-        description: 'Escolha um veículo para realizar a consulta.',
-        variant: 'destructive',
-      });
-      return;
-    }
-
-    if (!hasValidDocument) {
-      toast({
-        title: 'PDF não disponível',
-        description: 'Envie um PDF válido do manual do veículo para continuar.',
-        variant: 'destructive',
-      });
-      return;
-    }
-
-    setLoading(true);
-    setErrors({});
-    setResponse(null);
-    setCustomerMessage(null);
+    // Add loading message
+    const loadingMessage: ChatMessage = {
+      id: 'loading',
+      role: 'assistant',
+      content: '',
+      timestamp: new Date(),
+      isLoading: true,
+    };
+    setMessages((prev) => [...prev, loadingMessage]);
 
     try {
-      const { data, error: fnError } = await supabase.functions.invoke('ai-assistant', {
+      // Build chat history for context
+      const chatHistory = messages.map((msg) => ({
+        role: msg.role,
+        content: msg.content,
+      }));
+
+      const { data, error } = await supabase.functions.invoke('ai-assistant', {
         body: {
-          type: 'maintenance',
+          type: 'maintenance-chat',
           vehicleId: selectedVehicleId,
-          documentId: document?.id,
-          input: {
-            current_mileage: parseInt(mileage),
-            last_service_date: lastServiceDate,
-          },
+          documentId: document.id,
+          input: { message: content },
+          chatHistory,
         },
       });
 
-      if (fnError) throw fnError;
-      
-      setResponse(data as AIResponse);
+      if (error) throw error;
+
+      const assistantMessage: ChatMessage = {
+        id: crypto.randomUUID(),
+        role: 'assistant',
+        content: data.content,
+        timestamp: new Date(),
+        references: data.references,
+      };
+
+      // Replace loading message with actual response
+      setMessages((prev) =>
+        prev.filter((msg) => msg.id !== 'loading').concat(assistantMessage)
+      );
     } catch (err) {
-      console.error('Maintenance error:', err);
+      console.error('Chat error:', err);
+      // Remove loading message
+      setMessages((prev) => prev.filter((msg) => msg.id !== 'loading'));
       toast({
-        title: 'Erro na consulta',
-        description: err instanceof Error ? err.message : 'Não foi possível processar a consulta.',
+        title: 'Erro ao enviar mensagem',
+        description: err instanceof Error ? err.message : 'Tente novamente.',
         variant: 'destructive',
       });
     } finally {
-      setLoading(false);
+      setIsLoading(false);
     }
-  };
+  }, [selectedVehicleId, document?.id, messages, toast]);
 
-  const generateCustomerMessage = async () => {
-    if (!response) return;
-
-    setGeneratingMessage(true);
-
-    try {
-      const { data, error: fnError } = await supabase.functions.invoke('ai-assistant', {
-        body: {
-          type: 'customer-message',
-          vehicleId: selectedVehicleId,
-          response: response,
-          vehicleName: vehicle?.name,
-        },
-      });
-
-      if (fnError) throw fnError;
-      
-      setCustomerMessage(data.message as string);
-    } catch (err) {
-      console.error('Customer message error:', err);
-      toast({
-        title: 'Erro ao gerar mensagem',
-        description: 'Não foi possível gerar a mensagem.',
-        variant: 'destructive',
-      });
-    } finally {
-      setGeneratingMessage(false);
-    }
-  };
-
-  const copyMessage = async () => {
-    if (!customerMessage) return;
-    
-    await navigator.clipboard.writeText(customerMessage);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-    toast({ title: 'Mensagem copiada!' });
+  // Reset messages when vehicle changes
+  const handleVehicleChange = (vehicleId: string) => {
+    setSelectedVehicleId(vehicleId);
+    setMessages([]);
   };
 
   return (
     <MainLayout>
-      <div className="max-w-2xl mx-auto space-y-6">
-        <div>
-          <h1 className="text-2xl font-display font-bold text-foreground">
-            Manutenção Preventiva
-          </h1>
-          <p className="text-muted-foreground">
-            Receba recomendações de manutenção baseadas no manual
-          </p>
-        </div>
+      <div className="flex flex-col h-full max-w-5xl mx-auto gap-6">
+        {/* Header */}
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+          <div>
+            <h1 className="text-2xl font-display font-bold text-foreground flex items-center gap-2">
+              <MessageSquare className="h-6 w-6 text-primary" />
+              Chat de Manutenção
+            </h1>
+            <p className="text-muted-foreground">
+              Pergunte sobre manutenção e receba respostas do manual
+            </p>
+          </div>
 
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-lg">Informações do veículo</CardTitle>
-            <CardDescription>
-              Informe os dados atuais para recomendações precisas
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-6">
+          <div className="w-full sm:w-64">
             <VehicleSelector
               selectedVehicleId={selectedVehicleId}
-              onSelect={setSelectedVehicleId}
+              onSelect={handleVehicleChange}
             />
+          </div>
+        </div>
 
-            <form onSubmit={handleSubmit} className="space-y-4">
-              <div className="grid gap-4 sm:grid-cols-2">
-                <div className="space-y-2">
-                  <Label htmlFor="mileage">Quilometragem atual</Label>
-                  <Input
-                    id="mileage"
-                    type="number"
-                    placeholder="Ex: 50000"
-                    value={mileage}
-                    onChange={(e) => {
-                      setMileage(e.target.value);
-                      setErrors((prev) => ({ ...prev, mileage: undefined }));
-                    }}
-                  />
-                  {errors.mileage && (
-                    <span className="flex items-center gap-1 text-xs text-destructive">
-                      <AlertCircle className="h-3.5 w-3.5" />
-                      {errors.mileage}
+        {/* Main Content */}
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 flex-1 min-h-0">
+          {/* Chat Area */}
+          <div className="lg:col-span-2">
+            <ChatContainer
+              messages={messages}
+              onSendMessage={handleSendMessage}
+              isLoading={isLoading}
+              document={document || null}
+              vehicleName={vehicle?.name}
+            />
+          </div>
+
+          {/* Sidebar */}
+          <div className="space-y-4">
+            {/* Document Info */}
+            {document && (
+              <Card className="glass-card">
+                <CardHeader className="pb-2">
+                  <CardTitle className="text-sm flex items-center gap-2">
+                    <FileText className="h-4 w-4 text-primary" />
+                    Documento Ativo
+                  </CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <p className="text-sm font-medium truncate">{document.file_name}</p>
+                  <p className="text-xs text-muted-foreground mt-1">
+                    {(document.file_size / 1024 / 1024).toFixed(1)} MB
+                  </p>
+                  <div className="mt-3 pt-3 border-t border-border">
+                    <span
+                      className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${
+                        document.status === 'ready'
+                          ? 'bg-green-500/10 text-green-500'
+                          : document.status === 'processing'
+                          ? 'bg-yellow-500/10 text-yellow-500'
+                          : 'bg-red-500/10 text-red-500'
+                      }`}
+                    >
+                      {document.status === 'ready'
+                        ? '● Pronto para uso'
+                        : document.status === 'processing'
+                        ? '○ Processando...'
+                        : '✕ Qualidade insuficiente'}
                     </span>
-                  )}
-                </div>
+                  </div>
+                </CardContent>
+              </Card>
+            )}
 
-                <div className="space-y-2">
-                  <Label htmlFor="lastService">Data do último serviço</Label>
-                  <Input
-                    id="lastService"
-                    type="date"
-                    value={lastServiceDate}
-                    onChange={(e) => {
-                      setLastServiceDate(e.target.value);
-                      setErrors((prev) => ({ ...prev, date: undefined }));
-                    }}
-                    max={format(new Date(), 'yyyy-MM-dd')}
-                  />
-                  {errors.date && (
-                    <span className="flex items-center gap-1 text-xs text-destructive">
-                      <AlertCircle className="h-3.5 w-3.5" />
-                      {errors.date}
-                    </span>
-                  )}
-                </div>
-              </div>
-
-              <Button
-                type="submit"
-                className="w-full gap-2"
-                disabled={loading || !hasValidDocument || !selectedVehicleId}
-              >
-                {loading ? (
-                  <>
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                    Analisando...
-                  </>
-                ) : (
-                  <>
-                    <Wrench className="h-4 w-4" />
-                    Gerar recomendação com IA
-                  </>
-                )}
-              </Button>
-            </form>
-          </CardContent>
-        </Card>
-
-        {response && (
-          <>
-            <AIResponseDisplay response={response} />
-
-            {/* Customer Message Generator */}
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-lg">Mensagem para o cliente</CardTitle>
-                <CardDescription>
-                  Gere uma mensagem pronta para enviar ao cliente
+            {/* How it works */}
+            <Card className="glass-card">
+              <CardHeader className="pb-2">
+                <CardTitle className="text-sm">Como funciona</CardTitle>
+                <CardDescription className="text-xs">
+                  O chat responde apenas com base no manual
                 </CardDescription>
               </CardHeader>
-              <CardContent className="space-y-4">
-                {customerMessage ? (
-                  <div className="space-y-3">
-                    <div className="rounded-lg bg-muted p-4 text-sm whitespace-pre-wrap">
-                      {customerMessage}
-                    </div>
-                    <Button variant="outline" className="gap-2" onClick={copyMessage}>
-                      {copied ? (
-                        <>
-                          <Check className="h-4 w-4" />
-                          Copiado!
-                        </>
-                      ) : (
-                        <>
-                          <Copy className="h-4 w-4" />
-                          Copiar mensagem
-                        </>
-                      )}
-                    </Button>
-                  </div>
-                ) : (
-                  <Button
-                    variant="outline"
-                    className="w-full gap-2"
-                    onClick={generateCustomerMessage}
-                    disabled={generatingMessage}
-                  >
-                    {generatingMessage ? (
-                      <>
-                        <Loader2 className="h-4 w-4 animate-spin" />
-                        Gerando...
-                      </>
-                    ) : (
-                      'Gerar mensagem para o cliente'
-                    )}
-                  </Button>
-                )}
+              <CardContent className="space-y-3">
+                <div className="flex gap-3 text-xs">
+                  <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary font-medium">
+                    1
+                  </span>
+                  <p className="text-muted-foreground">
+                    Selecione um veículo com PDF enviado
+                  </p>
+                </div>
+                <div className="flex gap-3 text-xs">
+                  <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary font-medium">
+                    2
+                  </span>
+                  <p className="text-muted-foreground">
+                    Faça perguntas sobre manutenção ou intervalos
+                  </p>
+                </div>
+                <div className="flex gap-3 text-xs">
+                  <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary font-medium">
+                    3
+                  </span>
+                  <p className="text-muted-foreground">
+                    Receba respostas com referências de página
+                  </p>
+                </div>
               </CardContent>
             </Card>
-          </>
-        )}
+
+            {/* Example questions */}
+            <Card className="glass-card">
+              <CardHeader className="pb-2">
+                <CardTitle className="text-sm">Exemplos de perguntas</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <ul className="space-y-2 text-xs text-muted-foreground">
+                  <li>• Qual o intervalo de troca de óleo?</li>
+                  <li>• Quando devo trocar o filtro de ar?</li>
+                  <li>• Qual a pressão correta dos pneus?</li>
+                  <li>• Quais são as revisões programadas?</li>
+                  <li>• Como verificar o nível do fluido de freio?</li>
+                </ul>
+              </CardContent>
+            </Card>
+          </div>
+        </div>
       </div>
     </MainLayout>
   );

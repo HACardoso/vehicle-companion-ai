@@ -147,7 +147,11 @@
 
 @layer components {
   .glass-card {
-    @apply bg-card/80 backdrop-blur-sm border border-border/50 shadow-md;
+    @apply bg-card/80 backdrop-blur-sm border border-border/50 shadow-md rounded-lg;
+  }
+
+  .glass-card-dark {
+    @apply bg-card/40 backdrop-blur-md border border-border/30;
   }
 
   .status-ready {
@@ -171,11 +175,43 @@
   }
 
   .ai-response-section {
-    @apply bg-muted/50 rounded-lg p-4 space-y-3;
+    @apply bg-muted/50 rounded-lg p-4 space-y-3 border border-border/50;
   }
 
   .pdf-reference {
     @apply inline-flex items-center gap-1 text-xs bg-primary/10 text-primary px-2 py-0.5 rounded-full font-medium;
+  }
+
+  .confidence-bar {
+    @apply h-1.5 rounded-full bg-muted overflow-hidden;
+  }
+
+  .confidence-bar-fill {
+    @apply h-full rounded-full transition-all duration-500;
+  }
+
+  .hypothesis-card {
+    @apply flex items-start gap-3 p-3 rounded-lg bg-muted/30 border border-border/50;
+  }
+
+  .checklist-item {
+    @apply flex items-start gap-3 p-3 rounded-lg bg-muted/20 hover:bg-muted/40 transition-colors cursor-pointer;
+  }
+
+  .next-step-card {
+    @apply flex items-center gap-3 p-4 rounded-lg bg-muted/30 border border-border/50 hover:border-primary/30 transition-colors cursor-pointer;
+  }
+
+  .input-with-icon {
+    @apply relative;
+  }
+
+  .input-with-icon input {
+    @apply pl-10;
+  }
+
+  .input-with-icon .icon {
+    @apply absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground;
   }
 }
 
