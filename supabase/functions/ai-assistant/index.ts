@@ -1,4 +1,5 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.93.3";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -15,6 +16,62 @@ interface RequestBody {
   chatHistory?: Array<{ role: 'user' | 'assistant'; content: string }>;
 }
 
+interface DocumentData {
+  pdfBase64: string;
+  fileName: string;
+}
+
+async function getDocumentData(documentId: string): Promise<DocumentData | null> {
+  const supabaseUrl = Deno.env.get("SUPABASE_URL");
+  const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+
+  if (!supabaseUrl || !supabaseServiceKey) {
+    console.error("Missing Supabase configuration");
+    return null;
+  }
+
+  const supabase = createClient(supabaseUrl, supabaseServiceKey);
+
+  // Get document info
+  const { data: doc, error: docError } = await supabase
+    .from("vehicle_documents")
+    .select("file_path, file_name, status")
+    .eq("id", documentId)
+    .single();
+
+  if (docError || !doc || doc.status !== 'ready') {
+    console.log("Document not found or not ready:", docError);
+    return null;
+  }
+
+  // Download PDF directly
+  const { data: pdfData, error: downloadError } = await supabase.storage
+    .from("vehicle-documents")
+    .download(doc.file_path);
+
+  if (downloadError || !pdfData) {
+    console.log("PDF download error:", downloadError);
+    return null;
+  }
+
+  // Convert to base64 for sending to AI
+  const arrayBuffer = await pdfData.arrayBuffer();
+  const uint8Array = new Uint8Array(arrayBuffer);
+  
+  // Convert to base64 in chunks to avoid stack overflow
+  let binary = '';
+  const chunkSize = 8192;
+  for (let i = 0; i < uint8Array.length; i += chunkSize) {
+    const chunk = uint8Array.slice(i, i + chunkSize);
+    binary += String.fromCharCode.apply(null, Array.from(chunk));
+  }
+  const pdfBase64 = btoa(binary);
+
+  console.log(`PDF loaded: ${doc.file_name}, size: ${(uint8Array.length / 1024 / 1024).toFixed(2)} MB`);
+
+  return { pdfBase64, fileName: doc.file_name };
+}
+
 serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: corsHeaders });
@@ -29,8 +86,19 @@ serve(async (req) => {
       throw new Error("LOVABLE_API_KEY is not configured");
     }
 
+    // Fetch PDF data if documentId is provided
+    let pdfData: DocumentData | null = null;
+    if (documentId) {
+      pdfData = await getDocumentData(documentId);
+      console.log(`PDF data loaded: ${pdfData ? 'yes' : 'no'}`);
+    }
+
     let systemPrompt = "";
     let userPrompt = "";
+
+    const pdfInstruction = pdfData 
+      ? `\n\nIMPORTANTE: O manual do veículo "${pdfData.fileName}" está anexado. Baseie suas respostas PREFERENCIALMENTE no conteúdo do manual. Cite páginas específicas quando encontrar informações relevantes (ex: "conforme página 42 do manual").`
+      : '\n\nNOTA: O manual do veículo não está disponível. Forneça uma orientação geral baseada em conhecimento automotivo comum.';
 
     switch (type) {
       case "obd":
@@ -41,16 +109,14 @@ Sempre estruture sua resposta com as seções:
 2. O que pode causar (3 a 5 itens)
 3. O que checar agora (3 itens)
 4. Quando procurar uma oficina
+${pdfInstruction}
 
-IMPORTANTE: Sempre inclua referências ao PDF do manual quando disponível (ex: "página 12").
 Se não encontrar informações específicas no PDF, indique isso claramente e forneça orientação geral.
 Sempre termine com: "Isso é uma hipótese; não é certeza."`;
         
         userPrompt = `Código OBD-II: ${(input as { code: string })?.code}
-Veículo: ID ${vehicleId}
-Documento PDF: ${documentId ? 'Disponível' : 'Não disponível'}
 
-Explique este código de forma clara e acionável.`;
+Explique este código de forma clara e acionável, usando as informações do manual quando disponíveis.`;
         break;
 
       case "diagnosis":
@@ -63,24 +129,23 @@ ESTRUTURE sua resposta com:
 3. Checklist do que verificar agora (5 itens numerados)
 4. Próximos passos
 5. Quando procurar uma oficina
+${pdfInstruction}
 
 ALERTA DE SEGURANÇA: Se os sintomas indicarem risco (freio falhando, cheiro de combustível, luz de óleo, fumaça), 
 SEMPRE comece a resposta com um alerta de segurança recomendando NÃO continuar dirigindo.
 
-IMPORTANTE: Sempre inclua referências ao PDF do manual quando disponível (ex: "página X").
 Se não encontrar informações específicas no PDF, indique isso claramente.
 Sempre termine com: "Isso é uma hipótese; não é certeza."`;
         
         userPrompt = `Sintomas descritos: ${(input as { symptoms: string })?.symptoms}
-Veículo: ID ${vehicleId}
-Documento PDF: ${documentId ? 'Disponível' : 'Não disponível'}
 
-Analise os sintomas e forneça um diagnóstico estruturado.`;
+Analise os sintomas e forneça um diagnóstico estruturado, usando as informações do manual quando disponíveis.`;
         break;
 
       case "maintenance":
         systemPrompt = `Você é um especialista em manutenção automotiva.
 Analise a quilometragem e data do último serviço para recomendar manutenções preventivas.
+${pdfInstruction}
 
 ESTRUTURE sua resposta com uma lista de PELO MENOS 5 itens de manutenção.
 Cada item deve conter:
@@ -88,15 +153,12 @@ Cada item deve conter:
 - Quando fazer (km e/ou meses)
 - Referência no PDF (página X) - OBRIGATÓRIO quando disponível
 
-IMPORTANTE: Sempre inclua referências ao PDF do manual.
 Se não encontrar informações específicas, use valores padrão de mercado.
 Inclua observações de segurança quando relevante.`;
         
         const maintenanceInput = input as { current_mileage: number; last_service_date: string };
         userPrompt = `Quilometragem atual: ${maintenanceInput?.current_mileage} km
 Data do último serviço: ${maintenanceInput?.last_service_date}
-Veículo: ID ${vehicleId}
-Documento PDF: ${documentId ? 'Disponível' : 'Não disponível'}
 
 Liste as manutenções recomendadas com base no manual do veículo.`;
         break;
@@ -125,11 +187,12 @@ Gere uma mensagem profissional para o cliente.`;
         throw new Error(`Tipo de consulta inválido: ${type}`);
     }
 
-    // Handle maintenance-chat separately with chat history
+    // Handle maintenance-chat separately with chat history and PDF
     if (type === 'maintenance-chat') {
       const chatSystemPrompt = `Você é um assistente especializado em manutenção automotiva.
-REGRA FUNDAMENTAL: Você SOMENTE pode responder perguntas baseadas no conteúdo do manual/PDF do veículo.
+REGRA FUNDAMENTAL: Você SOMENTE pode responder perguntas baseadas no conteúdo do manual/PDF do veículo anexado.
 Se a pergunta não estiver relacionada ao manual ou manutenção do veículo, diga educadamente que só pode ajudar com informações do manual.
+${pdfData ? `\nO manual "${pdfData.fileName}" está anexado à conversa.` : '\nNenhum manual disponível.'}
 
 Suas respostas devem:
 1. Ser claras e objetivas
@@ -142,11 +205,35 @@ Se não encontrar a informação no PDF, diga: "Não encontrei essa informação
 
 Sempre termine respostas técnicas com: "Consulte um profissional para garantir a execução correta."`;
 
-      const messages = [
-        { role: "system", content: chatSystemPrompt },
-        ...(chatHistory || []).map(msg => ({ role: msg.role, content: msg.content })),
-        { role: "user", content: (input as { message: string })?.message || '' }
-      ];
+      // Build messages with PDF attachment for the first message
+      const userMessage = (input as { message: string })?.message || '';
+      
+      // deno-lint-ignore no-explicit-any
+      const messages: any[] = [{ role: "system", content: chatSystemPrompt }];
+      
+      // Add chat history
+      for (const msg of (chatHistory || [])) {
+        messages.push({ role: msg.role, content: msg.content });
+      }
+      
+      // Add current message with PDF if available
+      if (pdfData && chatHistory?.length === 0) {
+        // First message - include PDF
+        messages.push({
+          role: "user",
+          content: [
+            { type: "text", text: userMessage },
+            {
+              type: "image_url",
+              image_url: {
+                url: `data:application/pdf;base64,${pdfData.pdfBase64}`
+              }
+            }
+          ]
+        });
+      } else {
+        messages.push({ role: "user", content: userMessage });
+      }
 
       const aiResponse = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
         method: "POST",
@@ -155,7 +242,7 @@ Sempre termine respostas técnicas com: "Consulte um profissional para garantir 
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          model: "google/gemini-3-flash-preview",
+          model: "google/gemini-2.5-flash",
           messages,
         }),
       });
@@ -190,6 +277,32 @@ Sempre termine respostas técnicas com: "Consulte um profissional para garantir 
 
     console.log(`Processing ${type} request for vehicle ${vehicleId}`);
 
+    // Build messages with or without PDF
+    // deno-lint-ignore no-explicit-any
+    let messages: any[];
+    if (pdfData) {
+      messages = [
+        { role: "system", content: systemPrompt },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: userPrompt },
+            {
+              type: "image_url",
+              image_url: {
+                url: `data:application/pdf;base64,${pdfData.pdfBase64}`
+              }
+            }
+          ]
+        }
+      ];
+    } else {
+      messages = [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt }
+      ];
+    }
+
     const aiResponse = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -197,11 +310,8 @@ Sempre termine respostas técnicas com: "Consulte um profissional para garantir 
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "google/gemini-3-flash-preview",
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userPrompt },
-        ],
+        model: "google/gemini-2.5-flash",
+        messages,
       }),
     });
 
@@ -238,7 +348,7 @@ Sempre termine respostas técnicas com: "Consulte um profissional para garantir 
     }
 
     // Parse the AI response into structured format
-    const structuredResponse = parseAIResponse(content, type, documentId);
+    const structuredResponse = parseAIResponse(content, type, documentId, pdfData?.fileName);
 
     return new Response(
       JSON.stringify(structuredResponse),
@@ -253,7 +363,7 @@ Sempre termine respostas técnicas com: "Consulte um profissional para garantir 
   }
 });
 
-function parseAIResponse(content: string, type: string, documentId?: string) {
+function parseAIResponse(content: string, type: string, documentId?: string, fileName?: string) {
   const sections: Array<{ title: string; content: string | string[]; type: 'text' | 'list' | 'checklist' }> = [];
   let safetyAlert = null;
 
@@ -345,7 +455,7 @@ function parseAIResponse(content: string, type: string, documentId?: string) {
     safety_alert: safetyAlert,
     base_used: {
       source: documentId ? 'pdf' : 'general',
-      file_name: documentId ? 'manual_veiculo.pdf' : undefined,
+      file_name: fileName || (documentId ? 'manual_veiculo.pdf' : undefined),
       references: pageReferences.length > 0 ? pageReferences : undefined,
       no_relevant_excerpt: hasNoRelevantExcerpt,
     },
